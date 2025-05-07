@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: #f9faf6;
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+  position: relative;
+}
+
+/* Fondo con siluetas de aves */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  background-image: url('/swallow.svg'), url('/swallow.svg'), url('/swallow.svg'), url('/swallow.svg'), url('/swallow.svg'), url('/swallow.svg'), url('/swallow.svg'), url('/swallow.svg');
+  background-repeat: no-repeat, no-repeat, no-repeat, no-repeat, no-repeat, no-repeat, no-repeat, no-repeat;
+  background-size: 180px, 120px, 90px, 140px, 100px, 80px, 160px, 110px;
+  background-position: 5% 10%, 80% 60%, 60% 85%, 20% 80%, 90% 20%, 40% 30%, 70% 10%, 30% 60%;
+  opacity: 0.08;
+  pointer-events: none;
+}
+
+.main-content {
+  position: relative;
+  z-index: 1;
+}
