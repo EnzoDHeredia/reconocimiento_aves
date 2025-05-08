@@ -1,24 +1,44 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 import torch
-from torchvision import datasets, transforms
+from torchvision import transforms
 from torchvision.models import efficientnet_b1
 import os
 import requests
 import json
+import logging
+from werkzeug.utils import secure_filename
 
-# Configuración
+# Constantes
 IMG_SIZE = (224, 224)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-MODEL_PATH = 'model/modelo_102_B1.pth'
+THRESHOLD = 0.65  # Umbral de confianza para la predicción
+MODEL_PATH = os.environ.get('MODEL_PATH', 'model/modelo_102_B1.pth')
+EBIRD_TAXONOMY_PATH = os.environ.get('EBIRD_TAXONOMY_PATH', 'ebird_taxonomy.json')
+CLASSES_PATH = os.environ.get('CLASSES_PATH', 'classes.json')
+NOMBRE_COMUN_PATH = os.environ.get('NOMBRE_COMUN_PATH', 'nombre_comun_a_cientifico.json')
 
-# Cargar CLASSES y NOMBRE_COMUN_A_CIENTIFICO desde archivos JSON externos
-with open('classes.json', 'r', encoding='utf-8') as f:
-    CLASSES = json.load(f)
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
 
-with open('nombre_comun_a_cientifico.json', 'r', encoding='utf-8') as f:
-    NOMBRE_COMUN_A_CIENTIFICO = json.load(f)
+# Función auxiliar para cargar JSON
+def load_json(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Error cargando {path}: {e}")
+        return None
+
+# Cargar clases y taxonomía
+CLASSES = load_json(CLASSES_PATH)
+if CLASSES is None:
+    raise RuntimeError(f"No se pudo cargar {CLASSES_PATH}")
+
+NOMBRE_COMUN_A_CIENTIFICO = load_json(NOMBRE_COMUN_PATH)
+if NOMBRE_COMUN_A_CIENTIFICO is None:
+    raise RuntimeError(f"No se pudo cargar {NOMBRE_COMUN_PATH}")
 
 # Diccionario inverso: nombre_cientifico -> nombre_comun
 CIENTIFICO_A_NOMBRE_COMUN = {v: k for k, v in NOMBRE_COMUN_A_CIENTIFICO.items()}
@@ -27,6 +47,14 @@ EBIRD_API_KEY = "gb7uk3cug8e8"  # Reemplaza con tu API Key de eBird
 
 app = Flask(__name__)
 CORS(app)
+
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+MAX_CONTENT_LENGTH = 5 * 1024 * 1024  # 5 MB
+app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Preprocesamiento
 transform = transforms.Compose([
@@ -48,16 +76,15 @@ model.eval()
 
 def load_ebird_taxonomy():
     """Descarga y cachea la taxonomía de eBird localmente (solo si no existe el archivo)."""
-    taxonomy_path = 'ebird_taxonomy.json'
-    if os.path.exists(taxonomy_path):
-        with open(taxonomy_path, 'r', encoding='utf-8') as f:
+    if os.path.exists(EBIRD_TAXONOMY_PATH):
+        with open(EBIRD_TAXONOMY_PATH, 'r', encoding='utf-8') as f:
             return json.load(f)
     url = "https://api.ebird.org/v2/ref/taxonomy/ebird?fmt=json"
     headers = {"X-eBirdApiToken": EBIRD_API_KEY}
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
         data = response.json()
-        with open(taxonomy_path, 'w', encoding='utf-8') as f:
+        with open(EBIRD_TAXONOMY_PATH, 'w', encoding='utf-8') as f:
             json.dump(data, f)
         return data
     return []
@@ -92,39 +119,53 @@ def get_ebird_taxon_info(scientific_name_or_class):
             }
     return None
 
+def preprocess_image(img):
+    # Preprocesamiento de la imagen para el modelo
+    tensor = transform(img).unsqueeze(0).to(DEVICE)
+    return tensor
+
+def predict_class(tensor):
+    # Predicción de la clase usando el modelo
+    with torch.no_grad():
+        outputs = model(tensor)
+        _, predicted = torch.max(outputs, 1)
+        confidence = torch.softmax(outputs, dim=1)[0][predicted].item()
+    return predicted.item(), confidence
+
+def get_ebird_info(class_name):
+    # Busca información en la taxonomía de eBird
+    return EBIRD_SCI_TO_INFO.get(class_name.lower(), {})
+
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'file' not in request.files:
-        return jsonify({'error': 'No se encontró el archivo'}), 400
-
+        return jsonify({'error': 'No file part'}), 400
     file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'File type not allowed'}), 400
+
     try:
         image = Image.open(file.stream).convert('RGB')
-    except UnidentifiedImageError:
-        return jsonify({'error': 'El archivo no es una imagen válida o el formato no está soportado.'}), 400
+    except Exception:
+        return jsonify({'error': 'Invalid image file'}), 400
 
-    img_t = transform(image).unsqueeze(0).to(DEVICE)
+    tensor = preprocess_image(image)
+    pred_idx, confidence = predict_class(tensor)
 
-    with torch.no_grad():
-        output = model(img_t)
-        probabilities = torch.softmax(output, dim=1)
-        max_prob, pred = torch.max(probabilities, 1)
-        predicted_class_idx = pred.item()
-        max_prob_value = max_prob.item()
-        threshold = 0.65  # Puedes ajustar este valor
-
-        if max_prob_value < threshold:
-            predicted_class = "no se identifica ave"
-            predicted_class_idx = -1
-            ebird_info = None
-        else:
-            predicted_class = idx_to_class[predicted_class_idx]
-            ebird_info = get_ebird_taxon_info(predicted_class)
+    if confidence < THRESHOLD:
+        predicted_class = "no se identifica ave"
+        pred_idx = -1
+        ebird_info = None
+    else:
+        predicted_class = idx_to_class[pred_idx]
+        ebird_info = get_ebird_info(predicted_class)
 
     return jsonify({
         'class': predicted_class,
-        'index': predicted_class_idx,
-        'confidence': max_prob_value,
+        'index': pred_idx,
+        'confidence': confidence,
         'ebird_info': ebird_info
     })
 
